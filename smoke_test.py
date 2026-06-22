@@ -82,12 +82,14 @@ def silent():
 
 # ── stub pipeline builder ─────────────────────────────────────────────────────
 def build_stub_pipeline(analyses, *, graph=("asthma -[manifests_as]-> wheeze",),
-                        chunk_entities=("asthma", "wheeze"), llm_answer="ANSWER: clinical guidance"):
+                        chunk_entities=("asthma", "wheeze"),
+                        llm_blocks=({"type": "summary", "data": {"text": "clinical guidance"}},)):
     """
     A GraphRAGPipeline with external services stubbed but real in-process
     components (entity_processor, memory_adapter → RAM). `analyses` is a list of
-    gatekeeper-analysis dicts returned in order, one per .run() call.
-    Returns (pipeline, calls) where `calls` records each generate_response kwargs.
+    gatekeeper-analysis dicts returned in order, one per .run() call. The stub LLM
+    STREAMS `llm_blocks` (block dicts), mirroring the real NDJSON contract.
+    Returns (pipeline, calls, flags) where `calls` records each generate_response kwargs.
     """
     from graphrag.pipeline.graphrag_pipeline import GraphRAGPipeline
     from graphrag.processors.entity_processor import EntityProcessor
@@ -119,13 +121,20 @@ def build_stub_pipeline(analyses, *, graph=("asthma -[manifests_as]-> wheeze",),
     class L:
         def generate_response(self, **k):
             calls.append(k)
-            return llm_answer
+            for b in llm_blocks:
+                yield b
 
     p.query_analyzer = A()
     p.pinecone_retriever = PC()
     p.neo4j_retriever = N()
     p.llm = L()
     return p, calls, flags
+
+
+def run_blocks(p, *args, **kwargs) -> list[dict]:
+    """Consume the pipeline's NDJSON block generator into a list (stdout silenced)."""
+    with silent():
+        return list(p.run(*args, **kwargs))
 
 
 def analysis(intent="symptom_query", *, needs_followup=False, relevance=95,
@@ -182,9 +191,19 @@ def test_domain():
     R.check("gatekeeper prompt has relevance rubric + red flags + terminal state",
             all(s in GATEKEEPER_SYSTEM_PROMPT for s in
                 ("pulmonology_relevance", "RESPIRATORY / CARDIOPULMONARY RED FLAGS", "assessment_ready")))
+    from graphrag.domain.answer_prompt import OUTPUT_CONTRACT
     crit = compose_system_prompt(query_type="symptom_query", risk_level="critical", has_name=False)
-    R.check("critical answer prompt = structured emergency",
-            "EMERGENCY RESPONSE STRUCTURE" in crit and "POSSIBLE SERIOUS CAUSES" in crit)
+    R.check("critical answer prompt = emergency block sequence",
+            all(s in crit for s in ("EMERGENCY RESPONSE AS BLOCKS", "condition_list", "next_steps")))
+    R.check("answer prompt ends with the NDJSON output contract (last layer)",
+            crit.rstrip().endswith(OUTPUT_CONTRACT.rstrip())
+            and crit.index("OUTPUT FORMAT") > crit.index("STYLE & TONE"))
+    R.check("output contract enforces compact one-line JSON",
+            "COMPACT JSON" in crit and "WRONG" in crit)
+    term = compose_system_prompt(query_type="assessment_ready", risk_level="none",
+                                 has_name=False, terminal=True)
+    R.check("terminal prompt forbids a follow_up_questions block",
+            "TERMINAL TURN" in term and "follow_up_questions" in term)
     pulm = compose_system_prompt(query_type="symptom_query", risk_level="none", has_name=False)
     R.check("answer prompt is pulmonology-tuned", "pulmonology" in pulm.lower())
     # red flag detection
@@ -245,62 +264,67 @@ def test_entities():
 
 # ── 5. full pipeline scenarios ────────────────────────────────────────────────
 def test_pipeline_scenarios():
-    R.section("5. Full pipeline (stubbed services)")
-    from graphrag.domain import OUT_OF_SCOPE_MESSAGE
+    R.section("5. Full pipeline (stubbed services, NDJSON blocks)")
+    from graphrag.domain import out_of_scope_blocks
 
-    # a) in-scope → retrieval + graph + answer, graph entities are hybrid
+    def types(blocks):
+        return [b["type"] for b in blocks]
+
+    # a) in-scope → retrieval + graph + streamed blocks, graph entities are hybrid
     p, calls, flags = build_stub_pipeline([analysis("symptom_query", needs_followup=True)])
-    with silent():
-        ans = p.run("breathless and wheezing", session_id="sc_in")
+    blocks = run_blocks(p, "breathless and wheezing", session_id="sc_in")
     gctx = calls[-1]["graph_context"]
-    R.check("in-scope answered + retrieval ran", ans.startswith("ANSWER:") and flags["retrieved"])
+    R.check("in-scope streamed blocks + retrieval ran",
+            "summary" in types(blocks) and flags["retrieved"], str(types(blocks)))
     R.check("graph traversal produced relations", "manifests_as" in gctx, gctx[:60])
 
-    # b) out-of-scope → restricted, retrieval skipped
+    # b) out-of-scope → restricted (canned blocks), retrieval skipped
     p, calls, flags = build_stub_pipeline([analysis("symptom_query", relevance=20, needs_followup=False)])
-    with silent():
-        ans = p.run("itchy skin rash on my arm", session_id="sc_oos")
-    R.check("out-of-scope restricted", ans == OUT_OF_SCOPE_MESSAGE)
+    blocks = run_blocks(p, "itchy skin rash on my arm", session_id="sc_oos")
+    R.check("out-of-scope streams canned blocks (not a string)", blocks == out_of_scope_blocks(), str(blocks))
     R.check("out-of-scope skipped retrieval", flags["retrieved"] is False and not calls)
 
-    # c) emergency (red flag) → reasoned answer at critical risk, retrieval ran
+    # c) emergency (red flag) → streamed answer at critical risk, retrieval ran
     p, calls, flags = build_stub_pipeline([analysis("symptom_query", needs_followup=False)])
-    with silent():
-        ans = p.run("I am coughing up blood and struggling to breathe", session_id="sc_er")
-    R.check("emergency → reasoned LLM answer (not static)", ans.startswith("ANSWER:"))
+    blocks = run_blocks(p, "I am coughing up blood and struggling to breathe", session_id="sc_er")
+    R.check("emergency → streamed LLM blocks (not static)", "summary" in types(blocks))
     R.check("emergency → critical risk + retrieval ran",
-            calls and calls[-1]["risk_level"] == "critical" and flags["retrieved"], str(calls[-1]["risk_level"]) if calls else "no-call")
+            calls and calls[-1]["risk_level"] == "critical" and flags["retrieved"],
+            str(calls[-1]["risk_level"]) if calls else "no-call")
+
+    # c2) emergency with an LLM that yields NOTHING → canned emergency blocks fallback
+    p, calls, _ = build_stub_pipeline([analysis("symptom_query", needs_followup=False)], llm_blocks=())
+    blocks = run_blocks(p, "I am coughing up blood and struggling to breathe", session_id="sc_er2")
+    R.check("emergency + empty stream → canned emergency blocks",
+            types(blocks) == ["warning", "next_steps"] and blocks[0]["data"]["severity"] == "critical",
+            str(types(blocks)))
 
     # d) terminal state: 3 follow-needed turns → 3rd flips to assessment_ready
     p, calls, _ = build_stub_pipeline([analysis("symptom_query", needs_followup=True)] * 3)
-    with silent():
-        for _ in range(3):
-            p.run("I have a cough", session_id="sc_turns")
+    for _ in range(3):
+        run_blocks(p, "I have a cough", session_id="sc_turns")
     R.check("turn 1 not terminal", calls[0]["query_type"] == "symptom_query")
     R.check("turn 3 forced → assessment_ready", calls[2]["query_type"] == "assessment_ready" and calls[2]["needs_followup"] is False)
 
     # e) needs_followup False mid-loop → terminal
     p, calls, _ = build_stub_pipeline([analysis("symptom_query", needs_followup=True),
                                        analysis("symptom_query", needs_followup=False)])
-    with silent():
-        p.run("I have a cough", session_id="sc_nf")
-        p.run("still coughing", session_id="sc_nf")
+    run_blocks(p, "I have a cough", session_id="sc_nf")
+    run_blocks(p, "still coughing", session_id="sc_nf")
     R.check("needs_followup False → assessment_ready", calls[1]["query_type"] == "assessment_ready")
 
     # f) NO_RETRIEVAL medical follow-up → memory_only + findings (conclude)
     p, calls, _ = build_stub_pipeline([analysis("symptom_query", needs_followup=True),
                                        analysis("followup_query", needs_followup=True, action="route_to_followup")])
-    with silent():
-        p.run("I have a cough", session_id="sc_nr")
-        p.run("is it serious?", session_id="sc_nr")
+    run_blocks(p, "I have a cough", session_id="sc_nr")
+    run_blocks(p, "is it serious?", session_id="sc_nr")
     R.check("NO_RETRIEVAL follow-up → memory_only + has_findings",
             calls[1]["memory_only"] is True and calls[1]["has_findings"] is True, str({k: calls[1][k] for k in ("memory_only", "has_findings")}))
 
     # g) greeting → exempt from scope gate, answered
     p, calls, _ = build_stub_pipeline([analysis("greeting", relevance=5, needs_followup=False)])
-    with silent():
-        ans = p.run("hello", session_id="sc_hi")
-    R.check("greeting exempt → answered", ans.startswith("ANSWER:"))
+    blocks = run_blocks(p, "hello", session_id="sc_hi")
+    R.check("greeting exempt → answered", "summary" in types(blocks))
 
 
 # ── 6. Stage-4 prompt injection (real gemini_llm, generate_stream patched) ─────
@@ -317,7 +341,8 @@ def test_stage4_injection():
 
     def fake_stream(*, user_prompt, model, system_instruction=None, temperature=None):
         cap["sys"] = system_instruction
-        yield "ok"
+        # Emit one valid NDJSON block so the validator yields something real.
+        yield '{"type":"summary","data":{"text":"ok"}}'
 
     gl.generate_stream = fake_stream
     try:
@@ -327,16 +352,18 @@ def test_stage4_injection():
         return
 
     def call(**kw):
+        # generate_response is a generator now — consume it to drive the stream.
         with silent():
-            llm.generate_response(query_text="q", vector_context="", graph_context="",
-                                  memory_context="", conversation_history="", **kw)
-        return cap.get("sys", "")
+            out = list(llm.generate_response(query_text="q", vector_context="", graph_context="",
+                                             memory_context="", conversation_history="", **kw))
+        return cap.get("sys", ""), out
 
-    s = call(query_type="assessment_ready", needs_followup=False, memory_only=False, has_findings=True)
+    s, out = call(query_type="assessment_ready", needs_followup=False, memory_only=False, has_findings=True)
     R.check("assessment_ready → terminal constraint injected", ASSESSMENT_READY_INSTRUCTION in s)
-    s = call(query_type="followup_query", needs_followup=True, memory_only=True, has_findings=True)
+    R.check("stream yields validated block dicts", out and out[0]["type"] == "summary", str(out[:1]))
+    s, _ = call(query_type="followup_query", needs_followup=True, memory_only=True, has_findings=True)
     R.check("NO_RETRIEVAL → conclude constraint injected", NO_RETRIEVAL_CONCLUDE_INSTRUCTION in s)
-    s = call(query_type="symptom_query", needs_followup=True, memory_only=False, has_findings=True)
+    s, _ = call(query_type="symptom_query", needs_followup=True, memory_only=False, has_findings=True)
     R.check("mid-triage → NO constraint (follow-up allowed)",
             ASSESSMENT_READY_INSTRUCTION not in s and NO_RETRIEVAL_CONCLUDE_INSTRUCTION not in s)
 
@@ -396,12 +423,13 @@ def test_episodic_session_end():
         def retrieve_relations(self, *a, **k): return []
         def close(self): pass
     class L:
-        def generate_response(self, **k): return "ANSWER: ok"
+        def generate_response(self, **k):
+            yield {"type": "summary", "data": {"text": "ok"}}
     p.query_analyzer = A(); p.pinecone_retriever = PC(); p.neo4j_retriever = N(); p.llm = L()
 
     # A chat turn WITH a user_id must NOT write episodic memory (no per-turn ingest).
     with silent():
-        p.run("I have a cough and chest pain", session_id="ep_s", user_id="u1")
+        list(p.run("I have a cough and chest pain", session_id="ep_s", user_id="u1"))
     R.check("no per-turn episodic write during /chat", captured == [])
 
     # Closing the session writes exactly ONE consolidated episode.
@@ -415,6 +443,133 @@ def test_episodic_session_end():
     with silent():
         st2 = p.end_session(user_id="", session_id="ep_s")
     R.check("end_session is a no-op without user_id", st2.get("stored") is False, str(st2))
+
+
+# ── 9. NDJSON answer streaming (schema + validator + partial recovery) ────────
+def test_answer_streaming():
+    R.section("9. NDJSON answer streaming")
+    import json as _json
+    from graphrag.schemas.blocks import BLOCK_TYPES, AnswerResponse
+    from graphrag.validators.answer_validator import validate_line, iter_blocks, blocks_to_text
+    from graphrag.domain.messages import refusal_blocks, out_of_scope_blocks, emergency_blocks
+
+    R.check("BLOCK_TYPES = the 7-type contract",
+            len(BLOCK_TYPES) == 7 and "condition_list" in BLOCK_TYPES and "follow_up_questions" in BLOCK_TYPES)
+
+    # validate_line: accept good, drop bad
+    R.check("validate_line accepts a valid block",
+            validate_line('{"type":"summary","data":{"text":"hi"}}').type == "summary")
+    R.check("validate_line drops malformed JSON", validate_line("{not json") is None)
+    R.check("validate_line drops empty line", validate_line("   ") is None)
+    R.check("validate_line drops unknown type", validate_line('{"type":"foo","data":{}}') is None)
+    R.check("validate_line drops empty required list",
+            validate_line('{"type":"key_points","data":{"points":[]}}') is None)
+    R.check("validate_line drops extra keys (extra=forbid)",
+            validate_line('{"type":"summary","data":{"text":"x"},"z":1}') is None)
+
+    # partial recovery: a malformed middle line is dropped; neighbours still stream
+    toks = ['{"type":"summary",', '"data":{"text":"a"}}\n', 'GARBAGE LINE\n',
+            '{"type":"next_steps","data":{"steps":["see a doctor"]}}']
+    out = list(iter_blocks(iter(toks), terminal=False))
+    R.check("malformed line dropped, valid lines before/after still stream",
+            [b["type"] for b in out] == ["summary", "next_steps"], str([b["type"] for b in out]))
+    R.check("trailing line (no final newline) is flushed", out[-1]["data"]["steps"] == ["see a doctor"])
+    R.check("blocks_to_text renders streamed blocks", "see a doctor" in blocks_to_text(out))
+
+    # terminal=True drops follow_up_questions
+    fl = ('{"type":"follow_up_questions","data":{"questions":["q?"]}}\n'
+          '{"type":"summary","data":{"text":"s"}}')
+    R.check("terminal=True drops follow_up_questions",
+            [b["type"] for b in iter_blocks(iter([fl]), terminal=True)] == ["summary"])
+    R.check("terminal=False keeps follow_up_questions",
+            "follow_up_questions" in [b["type"] for b in iter_blocks(iter([fl]), terminal=False)])
+
+    # critical emergency sequence validates as warning+summary+condition_list+next_steps
+    crit = "\n".join([
+        '{"type":"warning","data":{"text":"Seek emergency care now.","severity":"critical"}}',
+        '{"type":"summary","data":{"text":"why this is concerning"}}',
+        '{"type":"condition_list","data":{"conditions":[{"name":"PE","likelihood":null,"description":"can sometimes be a clot"}]}}',
+        '{"type":"next_steps","data":{"steps":["Call 911"]}}',
+    ])
+    R.check("critical → warning+summary+condition_list+next_steps",
+            [b["type"] for b in iter_blocks(iter([crit]), terminal=True)]
+            == ["warning", "summary", "condition_list", "next_steps"])
+
+    # PRETTY-PRINTED / multi-line blocks must reassemble (depth-aware framing).
+    # gemini-2.5-flash-lite splits array-bearing blocks across lines — the old
+    # newline framing dropped them all.
+    pretty = (
+        '{"type":"summary","data":{"text":"Night-time breathing trouble has causes."}}\n'
+        '{\n  "type": "condition_list",\n  "data": {\n    "conditions": [\n'
+        '      {"name": "OSA", "likelihood": "high", "description": "apnea"},\n'
+        '      {"name": "GERD", "likelihood": "medium", "description": "reflux"},\n'
+        '      {"name": "Asthma", "likelihood": "medium", "description": "nocturnal"}\n'
+        '    ]\n  }\n}\n'
+        '{"type":"warning","data":{"text":"Seek care if you wake gasping.","severity":"caution"}}\n'
+        '{\n  "type": "follow_up_questions",\n  "data": {"questions": ["Snore?", "Heartburn?"]}\n}\n'
+        '{"type":"next_steps","data":{"steps":["Sleep diary","See a clinician"]}}'
+    )
+    # fed in awkward 5-char chunks to prove framing is stream-position-agnostic
+    chunks = [pretty[i:i + 5] for i in range(0, len(pretty), 5)]
+    pp = list(iter_blocks(iter(chunks), terminal=False))
+    R.check("pretty-printed multi-line blocks reassemble (none dropped)",
+            [b["type"] for b in pp]
+            == ["summary", "condition_list", "warning", "follow_up_questions", "next_steps"],
+            str([b["type"] for b in pp]))
+    R.check("multi-line condition_list array intact",
+            pp[1]["data"]["conditions"][0]["name"] == "OSA" and len(pp[1]["data"]["conditions"]) == 3)
+    R.check("terminal=True drops a pretty-printed follow_up_questions",
+            "follow_up_questions" not in [b["type"] for b in iter_blocks(iter(chunks), terminal=True)])
+
+    # A brace-balanced but schema-invalid object is dropped; neighbours survive.
+    mix = ('{"type":"summary","data":{"text":"ok"}}'
+           '{"type":"warning","data":{"severity":"nope"}}'
+           '{"type":"next_steps","data":{"steps":["go"]}}')
+    R.check("brace-balanced malformed object dropped; neighbours survive",
+            [b["type"] for b in iter_blocks(iter([mix]), terminal=False)] == ["summary", "next_steps"])
+
+    # Structural unwrapping: a top-level array and a {"blocks":[...]} wrapper.
+    arr = '[{"type":"summary","data":{"text":"a"}},{"type":"next_steps","data":{"steps":["x"]}}]'
+    R.check("top-level array unpacked into element blocks",
+            [b["type"] for b in iter_blocks(iter([arr]), terminal=False)] == ["summary", "next_steps"])
+    R.check("stray {\"blocks\":[...]} wrapper unwrapped",
+            [b["type"] for b in iter_blocks(iter(['{"blocks":[{"type":"summary","data":{"text":"w"}}]}']),
+                                            terminal=False)] == ["summary"])
+
+    # LAZY: first block reaches the client before the stream is exhausted
+    pulled = {"n": 0}
+    def lazy_tokens():
+        for t in ['{"type":"summary","data":{"text":"first"}}\n',
+                  '{"type":"next_steps","data":{"steps":["x"]}}']:
+            pulled["n"] += 1
+            yield t
+    gen = iter_blocks(lazy_tokens(), terminal=False)
+    first = next(gen)
+    R.check("first block emitted before whole response is buffered",
+            first["type"] == "summary" and pulled["n"] == 1, f"tokens pulled={pulled['n']}")
+
+    # canned no-LLM paths are blocks, not strings — and they validate
+    R.check("refusal_blocks → summary block", [b["type"] for b in refusal_blocks()] == ["summary"])
+    R.check("out_of_scope_blocks → summary block", [b["type"] for b in out_of_scope_blocks()] == ["summary"])
+    eb = emergency_blocks()
+    R.check("emergency_blocks → warning(critical)+next_steps",
+            [b["type"] for b in eb] == ["warning", "next_steps"] and eb[0]["data"]["severity"] == "critical")
+    canned = refusal_blocks() + out_of_scope_blocks() + emergency_blocks()
+    R.check("all canned blocks pass the schema",
+            all(validate_line(_json.dumps(b)) is not None for b in canned))
+    R.check("AnswerResponse wraps a block list (non-stream consumers)",
+            len(AnswerResponse(blocks=canned).blocks) == len(canned))
+
+
+# ── 10. Pipeline refuse path streams blocks ───────────────────────────────────
+def test_pipeline_refuse():
+    R.section("10. Pipeline refuse path (blocks)")
+    from graphrag.domain.messages import refusal_blocks
+    p, calls, flags = build_stub_pipeline(
+        [analysis("out_of_context", relevance=0, needs_followup=False, action="refuse")])
+    blocks = run_blocks(p, "what's the capital of France?", session_id="sc_refuse")
+    R.check("refuse streams canned blocks (not a string)", blocks == refusal_blocks(), str(blocks))
+    R.check("refuse skipped retrieval + LLM", flags["retrieved"] is False and not calls)
 
 
 # ── 7. HTTP API wiring (best-effort) ──────────────────────────────────────────
@@ -447,6 +602,8 @@ def main() -> None:
     test_pipeline_scenarios()
     test_stage4_injection()
     test_episodic_session_end()
+    test_answer_streaming()
+    test_pipeline_refuse()
     test_api_wiring()
     print("\n" + "=" * 64)
     total = R.passed + R.failed

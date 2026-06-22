@@ -37,7 +37,14 @@ from .vocabulary import (
     PULMONOLOGY_RELEVANCE_THRESHOLD,
 )
 from .entity_rules import DRUG_NAME_PATTERN, DRUG_NAME_STOPWORDS
-from .messages import EMERGENCY_MESSAGE, OUT_OF_SCOPE_MESSAGE, REFUSAL_MESSAGE
+from .messages import (
+    EMERGENCY_MESSAGE,
+    OUT_OF_SCOPE_MESSAGE,
+    REFUSAL_MESSAGE,
+    emergency_blocks,
+    out_of_scope_blocks,
+    refusal_blocks,
+)
 
 __all__ = [
     "GATEKEEPER_SYSTEM_PROMPT",
@@ -59,4 +66,7 @@ __all__ = [
     "EMERGENCY_MESSAGE",
     "OUT_OF_SCOPE_MESSAGE",
     "REFUSAL_MESSAGE",
+    "refusal_blocks",
+    "out_of_scope_blocks",
+    "emergency_blocks",
 ]

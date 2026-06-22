@@ -25,6 +25,8 @@ Design notes
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import sys
 import threading
@@ -52,9 +54,12 @@ except Exception:
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from graphrag.config.settings import ConfigError, settings
+
+logger = logging.getLogger("api")
 
 
 # ── Request / response models ─────────────────────────────────────────────────
@@ -132,24 +137,44 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/chat", response_model=ChatResponse, dependencies=[Depends(require_api_key)])
-def chat(req: ChatRequest, request: Request) -> ChatResponse:
+@app.post("/chat", dependencies=[Depends(require_api_key)])
+def chat(req: ChatRequest, request: Request) -> StreamingResponse:
+    """Stream the answer as NDJSON: one validated UI block per line.
+
+    Media type `application/x-ndjson`. The frontend reads the body stream, splits
+    on "\\n", JSON.parses each complete line, and renders by `.type` as it arrives.
+    """
     pipeline = request.app.state.pipeline
     lock = request.app.state.lock
-    # Sync endpoint → runs in a threadpool (off the event loop), so the memory
-    # layer's asyncio.run() works. Serialized: the shared pipeline isn't
-    # thread-safe (scale with multiple worker processes instead).
-    with lock:
-        try:
-            answer = pipeline.run(
-                query_text=req.message,
-                session_id=req.session_id,
-                user_id=req.user_id,
-            )
-        except Exception as exc:  # never leak a stack trace to the caller
-            raise HTTPException(status_code=500, detail=f"Pipeline error: {exc}") from exc
 
-    return ChatResponse(answer=answer or "", session_id=req.session_id)
+    def ndjson_stream():
+        # Sync generator → Starlette iterates it in a threadpool (off the event
+        # loop), so the memory layer's asyncio.run() works. The lock is held for
+        # the STREAM's whole duration: the shared pipeline isn't thread-safe
+        # (scale with multiple worker processes instead).
+        with lock:
+            try:
+                for block in pipeline.run(
+                    query_text=req.message,
+                    session_id=req.session_id,
+                    user_id=req.user_id,
+                ):
+                    yield json.dumps(block, ensure_ascii=False) + "\n"
+            except Exception as exc:  # never leak a stack trace; emit a block
+                logger.exception("Pipeline error during /chat stream")
+                yield json.dumps(
+                    {
+                        "type": "warning",
+                        "data": {
+                            "text": "Sorry — something went wrong generating a response. "
+                            "Please try again.",
+                            "severity": "info",
+                        },
+                    },
+                    ensure_ascii=False,
+                ) + "\n"
+
+    return StreamingResponse(ndjson_stream(), media_type="application/x-ndjson")
 
 
 @app.post("/session/end", dependencies=[Depends(require_api_key)])

@@ -3,12 +3,11 @@ import json
 
 from graphrag.config.settings import settings
 from graphrag.domain import (
-    EMERGENCY_MESSAGE,
-    MAX_FOLLOWUP_QUESTIONS,
-    OUT_OF_SCOPE_MESSAGE,
     PULMONOLOGY_RELEVANCE_THRESHOLD,
-    REFUSAL_MESSAGE,
     detect_red_flags,
+    emergency_blocks,
+    out_of_scope_blocks,
+    refusal_blocks,
 )
 from graphrag.domain.clinical_policy import (
     ASSESSMENT_READY_INTENT,
@@ -29,6 +28,7 @@ from graphrag.query_understanding import (
 )
 from graphrag.query_understanding.analyzer import MedicalQueryAnalyzer
 from graphrag.utils.logger import get_logger
+from graphrag.validators.answer_validator import blocks_to_text
 
 logger = get_logger(__name__)
 
@@ -116,7 +116,29 @@ class GraphRAGPipeline:
 
     # ------------------------------------------------------------------
 
+    def _emit_and_store(self, blocks, *, session, user_query, analysis, query_type):
+        """Persist a canned/short-circuit block response to memory, then yield it.
+
+        Used by the no-LLM paths (refuse / out-of-scope) so they stream typed
+        blocks over the SAME NDJSON transport as a generated answer.
+        """
+        self.memory_adapter.update_after_interaction(
+            session=session,
+            user_query=user_query,
+            assistant_answer=blocks_to_text(blocks),
+            analysis=analysis,
+            query_type=query_type,
+        )
+        yield from blocks
+
     def run(self, query_text: str, session_id: str = "default", user_id: str | None = None):
+        """Run one turn and STREAM the answer as validated NDJSON block dicts.
+
+        This is a generator: it yields one block `dict` at a time (the canned
+        short-circuits and the streamed Stage-4 answer alike). Session memory is
+        updated as the generator runs; episodic memory is written only at
+        `end_session`. Callers serialize blocks to NDJSON (`json.dumps + "\\n"`).
+        """
         original_query_text = query_text
         logger.info(f"\n{'═' * 72}")
         logger.info(f"📝 Original Query: {query_text}")
@@ -157,28 +179,26 @@ class GraphRAGPipeline:
         # graphrag/domain/clinical_policy.py::RED_FLAG_PATTERNS. Instead of
         # returning a bare alarm, we ESCALATE the turn (critical risk + full
         # retrieval) and let the answer LLM produce a structured, reasoned
-        # emergency response. The static EMERGENCY_MESSAGE is the fallback only.
+        # emergency response. The canned emergency_blocks() are the fallback only.
         red_flags = detect_red_flags(original_query_text)
         emergency = bool(red_flags)
         if red_flags:
             logger.info("🚨 Red-flag detected: %s — escalating to emergency response.", ", ".join(red_flags))
 
-        followup_questions = []
         if analysis and "error" not in analysis and analysis.get("final_action"):
             logger.info(f"🧠 Analysis Results:\n{json.dumps(analysis, indent=2)}")
 
             final_action = analysis.get("final_action")
             if final_action == "refuse" and not emergency:
-                msg = REFUSAL_MESSAGE
-                print(f"\n{msg}\n")
-                self.memory_adapter.update_after_interaction(
+                logger.info("⛔ Non-medical query refused.")
+                yield from self._emit_and_store(
+                    refusal_blocks(),
                     session=session,
                     user_query=original_query_text,
-                    assistant_answer=msg,
                     analysis=analysis,
                     query_type="unknown",
                 )
-                return msg
+                return
             elif final_action == "emergency_redirect":
                 logger.info("🚨 Gatekeeper flagged emergency — escalating to emergency response.")
                 emergency = True
@@ -200,16 +220,14 @@ class GraphRAGPipeline:
                     "⛔ Out of pulmonology scope (relevance=%s < %s) — restricting.",
                     relevance, PULMONOLOGY_RELEVANCE_THRESHOLD,
                 )
-                msg = OUT_OF_SCOPE_MESSAGE
-                print(f"\n{msg}\n")
-                self.memory_adapter.update_after_interaction(
+                yield from self._emit_and_store(
+                    out_of_scope_blocks(),
                     session=session,
                     user_query=original_query_text,
-                    assistant_answer=msg,
                     analysis=analysis,
                     query_type="out_of_scope",
                 )
-                return msg
+                return
 
             # ── Terminal-state gate: stop the follow-up loop ──────────────
             # The session carries a turn counter (working_memory). Once the user
@@ -242,14 +260,11 @@ class GraphRAGPipeline:
                 # gets clinical backfill rather than a memory-only deflection.
                 analysis["final_action"] = "retrieve"
 
-            if analysis.get("needs_followup"):
-                # Triage questioning: keep up to MAX_FOLLOWUP_QUESTIONS, ordered
-                # most-decision-relevant first by the gatekeeper. Fewer is better,
-                # but ambiguous/serious cases may warrant more than one.
-                raw_followups = analysis.get("followup_questions") or []
-                followup_questions = [q for q in raw_followups[:MAX_FOLLOWUP_QUESTIONS] if q]
-                if followup_questions:
-                    logger.info("💬 %d triage follow-up question(s) will be appended.", len(followup_questions))
+            # NOTE: triage follow-up questions are no longer appended
+            # deterministically here. The answer model emits them as a
+            # `follow_up_questions` block (guided by QUESTIONING_POLICY and the
+            # per-intent guidance), and the per-line validator drops that block
+            # when the turn is terminal. See answer_prompt.py / answer_validator.
 
             rewritten = analysis.get("rewritten_query")
             if rewritten and rewritten.strip() and rewritten != query_text:
@@ -410,10 +425,12 @@ class GraphRAGPipeline:
                 episodic_context_str.strip() + "\n\n" + combined_memory_context
             )
 
-        # Pass the rich memory context and history to the LLM. risk_level drives
-        # the urgency layer of the system prompt (critical → structured emergency
-        # response: safety → why → possible causes → next step → calm tone).
-        answer = self.llm.generate_response(
+        # Stream the answer as validated NDJSON blocks. risk_level drives the
+        # urgency layer of the system prompt (critical → emergency block sequence:
+        # warning → summary → condition_list → next_steps). Each block is yielded
+        # to the caller AS IT STREAMS and accumulated for the memory write.
+        answer_blocks: list[dict] = []
+        for block in self.llm.generate_response(
             query_text      = original_query_text,
             vector_context  = vector_context_str,
             graph_context   = graph_context_str,
@@ -425,24 +442,23 @@ class GraphRAGPipeline:
             needs_followup  = needs_followup_flag,
             memory_only     = memory_only,
             has_findings    = has_findings,
-        )
+        ):
+            answer_blocks.append(block)
+            yield block
 
-        # Safety net: if generation failed during an emergency, never leave the
-        # patient with nothing — fall back to the explicit emergency message.
-        if emergency and not answer:
-            answer = EMERGENCY_MESSAGE
-            print(f"\n{answer}\n")
+        # Safety net: if generation produced nothing during an emergency, never
+        # leave the patient with nothing — emit the canned emergency blocks.
+        if emergency and not answer_blocks:
+            logger.warning("Emergency generation produced no blocks — using canned emergency blocks.")
+            for block in emergency_blocks():
+                answer_blocks.append(block)
+                yield block
 
-        # Append follow-up questions at the end if any
-        if followup_questions and answer:
-            followup_block = "\n\n---\n💬 **To help me give you a more precise answer next time, could you also share:**\n" + "\n".join([f"- {q}" for q in followup_questions])
-            print(followup_block)
-            answer += followup_block
-
+        # Persist a plain-text rendering of the streamed blocks to session memory.
         self.memory_adapter.update_after_interaction(
             session=session,
             user_query=original_query_text,
-            assistant_answer=answer or "",
+            assistant_answer=blocks_to_text(answer_blocks),
             analysis=analysis,
             query_type=("emergency" if emergency else query_type.value),
         )
@@ -451,8 +467,6 @@ class GraphRAGPipeline:
         # written ONCE when the conversation closes — call `end_session(...)`
         # (exposed as POST /session/end). This keeps long-term memory to one
         # coherent episode per consultation instead of fragmented per-message ones.
-
-        return answer
 
     # ------------------------------------------------------------------
     # Episodic memory helpers (sync wrappers around the async services)

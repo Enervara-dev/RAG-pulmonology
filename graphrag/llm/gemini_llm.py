@@ -1,11 +1,19 @@
 """
 Streaming Gemini-backed answer generator used by the GraphRAG pipeline.
+
+STAGE 4 emits the answer as a stream of validated UI blocks (NDJSON). The model
+is instructed (via `compose_system_prompt`'s OUTPUT CONTRACT) to produce one JSON
+block per line; we keep TEXT streaming (no JSON mime/schema — that would force a
+single object and break per-line streaming) and validate each line as it arrives
+through `answer_validator.iter_blocks`. Valid blocks are yielded downstream as
+plain dicts; malformed lines are logged and dropped without aborting the stream.
 """
 
 
 from __future__ import annotations
 
 import time
+from typing import Iterator
 
 from graphrag.config.settings import settings
 from graphrag.domain.vocabulary import DEFAULT_ANSWER_GOAL
@@ -15,6 +23,7 @@ from graphrag.llm.gemini_client import (
     get_client,
 )
 from graphrag.utils.logger import get_logger
+from graphrag.validators.answer_validator import iter_blocks
 
 logger = get_logger(__name__)
 
@@ -25,10 +34,12 @@ class GeminiLLM:
         get_client()
         self._model = settings.ANSWER_MODEL or DEFAULT_MODEL
 
-    def generate_from_messages(self, messages: list[dict[str, str]]):
+    def generate_from_messages(self, messages: list[dict[str, str]]) -> Iterator[dict]:
         logger.info("[3/3] Sending memory-aware structured context to LLM Engine...")
         system_instruction, user_prompt = _split_messages(messages)
-        return self._stream(system_instruction=system_instruction, user_prompt=user_prompt)
+        return self._stream_blocks(
+            system_instruction=system_instruction, user_prompt=user_prompt, terminal=False
+        )
 
     def generate_response(
         self,
@@ -43,39 +54,42 @@ class GeminiLLM:
         needs_followup: bool = True,
         memory_only: bool = False,
         has_findings: bool = False,
-    ):
+    ) -> Iterator[dict]:
         """
-        Streaming Gemini answer for the legacy CLI path.
+        Stream the Stage-4 answer as validated block dicts.
 
         The system prompt is built via the layered composer in the graphrag
         domain layer — `graphrag.domain.answer_prompt.compose_system_prompt` —
-        so the assistant's persona/safety/grounding rules live in one
-        retargetable place. CLI doesn't carry per-turn risk into this method
-        today, so `risk_level` defaults to `"none"`.
+        so the assistant's persona/safety/grounding rules (and the NDJSON output
+        contract) live in one retargetable place.
+
+        Yields one validated block `dict` per emitted line, as it streams.
         """
         from graphrag.domain.answer_prompt import compose_system_prompt
         from graphrag.domain.clinical_policy import closure_directive
 
         logger.info("[3/3] Sending structured context to LLM Engine...")
 
-        has_name = "Patient name:" in memory_context
-        system_prompt = compose_system_prompt(
-            query_type=query_type,
-            risk_level=risk_level,
-            has_name=has_name,
-        )
-
-        # ── Stage-4 interception ──────────────────────────────────────────────
-        # The final point we control before the payload is handed to the Gemini
-        # SDK (which issues the httpx POST). If the diagnostic process is terminal
-        # (assessment_ready / no more follow-ups) or this is a NO_RETRIEVAL
-        # medical interaction, append a hard constraint so the model concludes
-        # instead of looping on follow-up questions.
+        # ── Terminal/closure resolution ───────────────────────────────────────
+        # If the diagnostic process is terminal (assessment_ready / no more
+        # follow-ups) or this is a NO_RETRIEVAL medical interaction, the model
+        # must conclude instead of looping on follow-up questions. `terminal`
+        # threads into BOTH the prompt (don't emit follow_up_questions) and the
+        # per-line validator (drop a follow_up_questions block if one slips out).
         constraint = closure_directive(
             intent=query_type,
             needs_followup=needs_followup,
             memory_only=memory_only,
             has_findings=has_findings,
+        )
+        terminal = constraint is not None
+
+        has_name = "Patient name:" in memory_context
+        system_prompt = compose_system_prompt(
+            query_type=query_type,
+            risk_level=risk_level,
+            has_name=has_name,
+            terminal=terminal,
         )
         if constraint:
             system_prompt = f"{system_prompt}\n\n{constraint}"
@@ -100,44 +114,56 @@ USER QUESTION: {query_text}
 {graph_context}
 """
 
-        return self._stream(system_instruction=system_prompt, user_prompt=user_prompt)
+        return self._stream_blocks(
+            system_instruction=system_prompt, user_prompt=user_prompt, terminal=terminal
+        )
 
-    def _stream(self, *, system_instruction: str | None, user_prompt: str) -> str | None:
+    def _stream_blocks(
+        self, *, system_instruction: str | None, user_prompt: str, terminal: bool
+    ) -> Iterator[dict]:
+        """
+        Run the raw token stream through the per-line block validator and yield
+        validated block dicts. Transport/SDK errors are caught and logged; the
+        per-line validator drops bad lines without failing the whole stream.
+        """
+        t_start = time.monotonic()
+        logger.info("\n" + "=" * 80)
+        logger.info("AI RESPONSE (NDJSON blocks)")
+        logger.info("=" * 80)
+
+        count = 0
         try:
-            t_start = time.monotonic()
-
-            logger.info("\n" + "=" * 80)
-            logger.info("AI RESPONSE")
-            logger.info("=" * 80 + "\n")
-
-            answer = ""
-            t_first_visible: float | None = None
-
-            for piece in generate_stream(
-                model=self._model,
-                system_instruction=system_instruction,
-                user_prompt=user_prompt,
+            for block in iter_blocks(
+                self._raw_tokens(system_instruction, user_prompt, t_start),
+                terminal=terminal,
             ):
-                if t_first_visible is None:
-                    t_first_visible = time.monotonic()
-                    logger.info(
-                        f"⏱️  Time-to-first-visible-token: "
-                        f"{(t_first_visible - t_start) * 1000:.0f}ms"
-                    )
-                print(piece, end="", flush=True)
-                answer += piece
+                count += 1
+                yield block
+        except Exception as e:  # transport/SDK error mid-stream
+            logger.error(f"LLM Error: {e}")
 
-            t_end = time.monotonic()
-            logger.info(
-                f"\n⏱️  Stream complete in {(t_end - t_start) * 1000:.0f}ms "
-                f"({len(answer)} visible chars)"
-            )
-            print("\n\n" + "=" * 80 + "\n")
-            return answer
+        t_end = time.monotonic()
+        logger.info(
+            "⏱️  Stream complete in %.0fms (%d block(s))",
+            (t_end - t_start) * 1000, count,
+        )
 
-        except Exception as e:
-            logger.error(f"\nLLM Error: {e}")
-            return None
+    def _raw_tokens(
+        self, system_instruction: str | None, user_prompt: str, t_start: float
+    ) -> Iterator[str]:
+        """Yield raw text chunks from Gemini, logging time-to-first-token."""
+        first: float | None = None
+        for piece in generate_stream(
+            model=self._model,
+            system_instruction=system_instruction,
+            user_prompt=user_prompt,
+        ):
+            if first is None:
+                first = time.monotonic()
+                logger.info(
+                    "⏱️  Time-to-first-token: %.0fms", (first - t_start) * 1000
+                )
+            yield piece
 
 
 def _split_messages(messages: list[dict[str, str]]) -> tuple[str | None, str]:

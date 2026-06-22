@@ -75,6 +75,8 @@ def closure_directive(
 # ── High-signal symptoms (drive ranking + urgency) ────────────────────────────
 # Prose, for prompt injection. Mirrors the canonical risk keys in the memory
 # layer (session_memory/domain/risk_rules.py) but is phrased for the LLM.
+# NOTE: these features escalate risk only when DESCRIBED AS PRESENT and severe —
+# not when merely named, mild, historical, or hypothetical ("could this be…").
 HIGH_SIGNAL_SYMPTOMS_TEXT = (
     "chest pain, coughing up blood (haemoptysis), wheeze, smoking history, signs of "
     "low oxygen (bluish lips/fingertips, marked breathlessness at rest), severe "

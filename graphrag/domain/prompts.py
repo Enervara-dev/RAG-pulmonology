@@ -233,19 +233,35 @@ Notes:
 SYMPTOM WEIGHTING & RISK LEVEL
 ==============================
 
-Set `risk_level` by the HIGHEST-signal feature present, not the average. These
-high-signal features should raise risk to at least "high" (and "critical" if
-happening now / severe):
+`risk_level` reflects ACUITY (severity + immediacy + danger), NOT symptom
+identity. Naming a symptom is NOT escalation. DEFAULT to "low" and only raise
+risk when the DESCRIPTION carries severity, persistence, or a red-flag feature.
 
-* chest pain, coughing up blood (haemoptysis)
-* signs of low oxygen: bluish lips/fingertips, severe breathlessness at rest
-* fast breathing (tachypnea), severe weakness, fainting/near-fainting
-* persistent or high fever, audible wheeze with distress
-* known severe lung disease with an acute change
+* "low" — unqualified / mild / isolated complaints with no stated severity or
+  duration and no red flag. final_action = "retrieve", and set
+  needs_followup = true to ask 1–2 triage questions. This covers fever, cough,
+  sore throat, nasal congestion / blocked nose, mild breathlessness, mild
+  headache, and similar bare mentions.
+* "medium" — a symptom that is persistent, recurrent, or moderately severe, but
+  with NO red flag.
+* "high" — a high-signal feature described as ACTUALLY PRESENT and significant
+  (not historical, not "could this be…"). High-signal features: chest pain,
+  coughing up blood (haemoptysis), signs of low oxygen (bluish lips/fingertips,
+  severe breathlessness at rest), fast breathing, severe weakness,
+  fainting/near-fainting, high or persistent fever, audible wheeze with distress,
+  or known severe lung disease with an acute change.
+* "critical" + final_action = "emergency_redirect" — ONLY a HAPPENING-NOW
+  red flag from the emergency list (severe breathlessness, cyanosis, can't speak
+  in full sentences, new confusion, persistent/crushing chest pain, haemoptysis,
+  syncope, low-oxygen signs).
 
-Smoking history and known chronic lung disease are risk MODIFIERS — they raise
-concern for an otherwise borderline respiratory complaint. Mild, isolated, or
-clearly resolved symptoms stay "low"/"none".
+A symptom mentioned WITHOUT severity, duration, or a red-flag feature is never
+"critical" and never an emergency_redirect — default such queries to "low".
+
+Set `risk_level` by the HIGHEST-acuity feature present, not the average. Smoking
+history and known chronic lung disease are risk MODIFIERS — they raise concern
+for an otherwise borderline respiratory complaint, not for a bare mention. Mild,
+isolated, or clearly resolved symptoms stay "low"/"none".
 
 ==================================================
 NON-MEDICAL & HARMFUL REQUESTS

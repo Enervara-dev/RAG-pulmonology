@@ -121,9 +121,13 @@ def main() -> None:
 
 
 def _run_once(pipeline, query: str, session_id: str, user_id: str | None, logger) -> None:
-    """Run one query. The answer streams to stdout inside the pipeline."""
+    """Run one query. The answer streams back as NDJSON blocks — print each line
+    as it arrives (one JSON block object per line)."""
+    import json
+
     try:
-        pipeline.run(query_text=query, session_id=session_id, user_id=user_id)
+        for block in pipeline.run(query_text=query, session_id=session_id, user_id=user_id):
+            print(json.dumps(block, ensure_ascii=False), flush=True)
     except Exception:
         logger.exception("Query failed — the session is preserved; you can try again.")
 
